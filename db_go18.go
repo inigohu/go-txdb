@@ -6,7 +6,10 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
+	"fmt"
 	"io"
+	"time"
 )
 
 func buildRows(r *sql.Rows) (driver.Rows, error) {
@@ -91,15 +94,73 @@ func (c *conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	c.Lock()
 	defer c.Unlock()
 
-	done := make(chan struct{})
-	defer close(done)
+	maxRetries := 5
+	retryCount := 0
+	for {
+		done := make(chan struct{})
+		tx, err := c.beginTxOnce(ctx, done)
+		if err != nil {
+			return nil, err
+		}
 
-	tx, err := c.beginTxOnce(ctx, done)
-	if err != nil {
-		return nil, err
+		// errWithSQLState is implemented by pgx (pgconn.PgError) and lib/pq
+		type errWithSQLState interface {
+			SQLState() string
+		}
+
+		c.execHistory = append(c.execHistory, &exec{
+			Query: query,
+			Args:  args,
+		})
+
+		var sqlErr errWithSQLState
+		res, err := tx.ExecContext(ctx, query, mapNamedArgs(args)...)
+		if err != nil {
+			isSQLErr := errors.As(err, &sqlErr)
+			if isSQLErr {
+				fmt.Printf("%s - sqlErr - %s\n", c.dsn, sqlErr.SQLState())
+
+				if err := tx.Rollback(); err != nil {
+					return nil, fmt.Errorf("rollback failed: %w", err)
+				}
+				if sqlErr.SQLState() != "40001" {
+					return nil, err
+				}
+				tx, err := c.drv.db.Begin()
+				if err != nil {
+					return nil, fmt.Errorf("start new tx failed: %w", err)
+				}
+				fmt.Printf("%s - NEW TX \n", c.dsn)
+				c.tx = tx
+				c.saves = 0
+				c.saves++
+				id := fmt.Sprintf("tx_%d", c.saves)
+				_, err = tx.Exec(c.savePoint.Create(id))
+				if err != nil {
+					return nil, err
+				}
+				fmt.Printf("%s - SAVEPOINT %s\n", c.dsn, id)
+				c.Unlock()
+				for i, eh := range c.execHistory {
+					fmt.Printf("%s - apply history - %x\n", c.dsn, i)
+					res, err = c.ExecContext(ctx, eh.Query, eh.Args)
+				}
+				c.Lock()
+				return res, err
+			}
+			retryCount++
+			if maxRetries > 0 && retryCount > maxRetries {
+				close(done)
+				return nil, fmt.Errorf("retrying txn failed after %d attempts. original error: %s", maxRetries, err)
+			}
+			fmt.Printf("%s - Retrying txn...\n", c.dsn)
+			close(done)
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		close(done)
+		return res, err
 	}
-
-	return tx.ExecContext(ctx, query, mapNamedArgs(args)...)
 }
 
 // Implement the "ConnBeginTx" interface

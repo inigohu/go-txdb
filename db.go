@@ -94,16 +94,23 @@ func Register(name, drv, dsn string, options ...func(*conn) error) {
 	})
 }
 
+// exec is a simple struct to hold the query and its arguments
+type exec struct {
+	Query string
+	Args  []driver.NamedValue
+}
+
 // txDriver is an sql driver which runs on single transaction
 // when the Close is called, transaction is rolled back
 type conn struct {
 	sync.Mutex
-	tx        *sql.Tx
-	dsn       string
-	opened    uint
-	drv       *TxDriver
-	saves     uint
-	savePoint SavePoint
+	tx          *sql.Tx
+	dsn         string
+	opened      uint
+	drv         *TxDriver
+	saves       uint
+	savePoint   SavePoint
+	execHistory []*exec
 
 	cancel func()
 	ctx    interface{ Done() <-chan struct{} }
